@@ -1,0 +1,26 @@
+- [x] Understand RoPE
+    - [x] Math-wise
+    - [x] Code-wise
+- [x] Implement RoPE
+- [x] Start Implementing Decoder Layer
+    - [x] MHA with RoPE
+    - [x] MLP
+- [x] Create a config file for smollm2
+- [x] Port weights and sanity check
+- [x] Port tokenizer vocab and update chat template
+- [x] Run tokenizer on the full dataset for sanity
+- [x] Setup loss function and test backprop
+- [x] Seperate train, val and test
+- [x] Test validation loop and test loop
+- [x] Manage Artifacts
+    - [x] Model weights `.ckpt` file
+    - [x] Tokenizer `.json` file
+    - [x] Dataset .jsonl file?
+- [x] Upload dataset to hf (private)
+- [x] Port code to lightning and ignite!
+- [ ] Upload to github
+- [ ] Clean the code
+- [ ] Fix the data
+- [ ] Speed up model
+- [ ] Support multi-gpu
+- [ ] Retrained the model after fixing the data
