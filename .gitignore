@@ -3,3 +3,9 @@ artifacts/
 
 # data
 data/
+
+# backup
+backup/
+
+# cache
+__pycache__/

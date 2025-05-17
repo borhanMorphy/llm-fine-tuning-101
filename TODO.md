@@ -18,9 +18,9 @@
     - [x] Dataset .jsonl file?
 - [x] Upload dataset to hf (private)
 - [x] Port code to lightning and ignite!
-- [ ] Upload to github
-- [ ] Clean the code
-- [ ] Fix the data
-- [ ] Speed up model
+- [x] Upload to github
+- [x] Clean the code
+- [x] Fix the data
+- [ ] Speed up model via KV cache?
 - [ ] Support multi-gpu
 - [ ] Retrained the model after fixing the data
