@@ -709,6 +709,10 @@ def main(args):
 
     model = SmolLM2.from_checkpoint(os.path.join(model_path, f"{model_name}-it.ckpt"))
 
+    if (num_available_gpus := torch.cuda.device_count()) > 1:
+        print(f"{num_available_gpus} GPUs found, switching to nn.DataParallel")
+        model = nn.DataParallel(model)
+
     model.to(device, dtype)
 
     learning_rate: float = args.learning_rate
@@ -774,8 +778,15 @@ def main(args):
                 f"Found a better model {best_val_loss:.2f} -> {val_loss:.2f}, saving..."
             )
             best_val_loss = val_loss
+            if num_available_gpus > 1:
+                config = asdict(model.module.config)
+                weights = model.module.state_dict()
+            else:
+                config = asdict(model.config)
+                weights = model.state_dict()
+
             torch.save(
-                {"config": asdict(model.config), "weights": model.state_dict()},
+                {"config": config, "weights": weights},
                 f"{model_name}-best-full-sft.ckpt",
             )
 

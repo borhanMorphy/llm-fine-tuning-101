@@ -21,6 +21,6 @@
 - [x] Upload to github
 - [x] Clean the code
 - [x] Fix the data
-- [ ] Speed up model via KV cache?
-- [ ] Support multi-gpu
+- [x] Support multi-gpu
 - [ ] Retrained the model after fixing the data
+- [ ] Export to ONNX with KV cache
