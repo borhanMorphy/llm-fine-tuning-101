@@ -24,3 +24,13 @@
 - [x] Support multi-gpu
 - [ ] Retrained the model after fixing the data
 - [ ] Export to ONNX with KV cache
+
+- [ ] LoRA Training
+- [ ] Understand DPO
+    - [ ] Math-wise
+    - [ ] Code-wise
+- [ ] Create a dataset for DPO
+- [ ] Implement DPO
+- [ ] Traing with DPO
+- [ ] Implement Gemma3 1b
+- [ ] Training with Gemma3 1b LoRA SFT and DPO afterwards
