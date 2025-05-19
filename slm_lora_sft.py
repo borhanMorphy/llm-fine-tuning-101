@@ -9,6 +9,7 @@ from tqdm import tqdm
 from functools import partial
 import math
 import random
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -288,6 +289,95 @@ class ModelConfig:
 
     mlp_inter_hidden_size: int
     mlp_bias: bool
+
+
+class LoRALinear(nn.Module):
+    def __init__(
+        self, in_features: int, out_features: int, rank: int, alpha: float = 1.0
+    ):
+        super().__init__()
+        assert rank < min(in_features, out_features), (
+            "rank must be way smaller than original features"
+        )
+        self.A = nn.Parameter(torch.randn(size=(in_features, rank)), requires_grad=True)
+        self.B = nn.Parameter(
+            torch.zeros(size=(rank, out_features)), requires_grad=True
+        )
+        self.register_buffer("scaler", torch.tensor(alpha / rank))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.A.data.normal_(mean=0, std=1)
+        self.B.data.fill_(0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return ((x @ self.A) @ self.B) * self.scaler
+
+
+class LoraAdaptor:
+    def __init__(self, rank: int, alpha: float = 1.0):
+        self.rank = rank
+        self.alpha = alpha
+        self._layers: List[Tuple[str, nn.Linear, LoRALinear]] = []
+
+    def state_dict(self) -> OrderedDict:
+        state_dict = OrderedDict()
+        for name, _, lora_layer in self._layers:
+            for key, weight in lora_layer.state_dict().items():
+                full_name = ".".join([name, key])
+                state_dict[full_name] = weight
+        return state_dict
+
+    @staticmethod
+    def get_updated_forward(linear_layer: nn.Linear, lora_layer: LoRALinear):
+        def updated_forward(x: Tensor):
+            h = lora_layer(x)
+            return F.linear(x, linear_layer.weight, linear_layer.bias) + h
+
+        return updated_forward
+
+    def register_layers(self, model: nn.Module, layer_types=None):
+        assert layer_types is not None
+
+        for name, module in model.named_modules():
+            if not isinstance(module, layer_types):
+                continue
+
+            linear_layers = filter(
+                lambda sub_module: isinstance(sub_module[1], nn.Linear),
+                module.named_modules(),
+            )
+
+            for subname, linear_layer in linear_layers:
+                # get the full name
+                full_name = ".".join([name, subname])
+                # define the lora layer
+                lora_layer = LoRALinear(
+                    linear_layer.in_features,
+                    linear_layer.out_features,
+                    self.rank,
+                    alpha=self.alpha,
+                )
+                # replace linear layer forward
+                linear_layer.forward = self.get_updated_forward(
+                    linear_layer, lora_layer
+                )
+                # register it
+                self._layers.append((full_name, linear_layer, lora_layer))
+
+    def get_layers(self) -> Generator[Tuple[str, LoRALinear], None, None]:
+        for name, _, layer in self._layers:
+            if isinstance(layer, LoRALinear):
+                yield name, layer
+
+    def merge_layers(self):
+        # TODO
+        raise NotImplementedError("`merge_layers(...)` not yet implemented")
+
+    def load_state_dict(self):
+        # TODO
+        raise NotImplementedError("`load_state_dict(...)` not yet implemented")
 
 
 class MLP(nn.Module):
@@ -709,11 +799,26 @@ def main(args):
 
     model = SmolLM2.from_checkpoint(os.path.join(model_path, f"{model_name}-it.ckpt"))
 
-    if (num_available_gpus := torch.cuda.device_count()) > 1:
+    lora_adaptor = LoraAdaptor(args.rank, alpha=args.alpha)
+
+    lora_adaptor.register_layers(model, layer_types=(RoPEMultiHeadAttentionWithGQA,))
+
+    if ((num_available_gpus := torch.cuda.device_count()) > 1) and device.startswith(
+        "cuda"
+    ):
         print(f"{num_available_gpus} GPUs found, switching to nn.DataParallel")
         model = nn.DataParallel(model)
 
     model.to(device, dtype)
+
+    # freeze the main model
+    model.requires_grad_(False)
+
+    lora_parameters = []
+
+    for name, layer in lora_adaptor.get_layers():
+        layer.to(device, dtype)
+        lora_parameters += list(layer.parameters())
 
     learning_rate: float = args.learning_rate
     epoch: int = args.epoch
@@ -749,7 +854,7 @@ def main(args):
     criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        lora_parameters,
         lr=learning_rate,
     )
 
@@ -778,16 +883,10 @@ def main(args):
                 f"Found a better model {best_val_loss:.2f} -> {val_loss:.2f}, saving..."
             )
             best_val_loss = val_loss
-            if num_available_gpus > 1:
-                config = asdict(model.module.config)
-                weights = model.module.state_dict()
-            else:
-                config = asdict(model.config)
-                weights = model.state_dict()
 
             torch.save(
-                {"config": config, "weights": weights},
-                f"{model_name}-best-full-sft.ckpt",
+                lora_adaptor.state_dict(),
+                os.path.join(model_path, f"{model_name}-best-lora-sft.pt"),
             )
 
     test_loss = test_loop(model, test_dl, criterion, device)
@@ -811,5 +910,7 @@ if __name__ == "__main__":
     ap.add_argument("--batch-size", "-bs", type=int, default=32)
     ap.add_argument("--epoch", "-e", type=int, default=10)
     ap.add_argument("--ignore-index", "-ig", type=int, default=-100)
+    ap.add_argument("--rank", "-r", type=int, required=True)
+    ap.add_argument("--alpha", "-a", type=float, default=1.0)
 
     main(ap.parse_args())

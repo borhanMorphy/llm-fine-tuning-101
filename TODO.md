@@ -25,10 +25,14 @@
 - [ ] Retrained the model after fixing the data
 - [ ] Export to ONNX with KV cache
 
+- [x] Understand LoRA
+    - [x] Math-wise
+    - [x] Code-wise
+- [x] Implement LoRA
 - [ ] LoRA Training
-- [ ] Understand DPO
-    - [ ] Math-wise
-    - [ ] Code-wise
+- [x] Understand DPO
+    - [x] Math-wise
+    - [x] Code-wise
 - [ ] Create a dataset for DPO
 - [ ] Implement DPO
 - [ ] Traing with DPO
