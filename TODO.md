@@ -1,3 +1,4 @@
+# Main Tasks
 - [x] Understand RoPE
     - [x] Math-wise
     - [x] Code-wise
@@ -15,7 +16,7 @@
 - [x] Manage Artifacts
     - [x] Model weights `.ckpt` file
     - [x] Tokenizer `.json` file
-    - [x] Dataset .jsonl file?
+    - [x] Dataset .jsonl file
 - [x] Upload dataset to hf (private)
 - [x] Port code to lightning and ignite!
 - [x] Upload to github
@@ -23,18 +24,25 @@
 - [x] Fix the data
 - [x] Support multi-gpu
 - [ ] Retrained the model after fixing the data
-- [ ] Export to ONNX with KV cache
-
-- [x] Understand LoRA
+- [ ] Export to vLLM offline (managed kv cache?)
+- [x] Understand LoRAç
     - [x] Math-wise
     - [x] Code-wise
 - [x] Implement LoRA
-- [ ] LoRA Training
+- [x] LoRA Training
 - [x] Understand DPO
     - [x] Math-wise
     - [x] Code-wise
 - [ ] Create a dataset for DPO
 - [ ] Implement DPO
 - [ ] Traing with DPO
-- [ ] Implement Gemma3 1b
-- [ ] Training with Gemma3 1b LoRA SFT and DPO afterwards
+- [x] Implement Gemma3 1b
+    - [x] Port tokenizer vocab and update chat template
+    - [x] Implement sliding window attention via flex attention
+    - [x] Sanity check of whole implementation
+    - [x] Weight porting script and sanity check
+- [ ] Training with Gemma3 1b LoRA SFT
+- [ ] Training with Gemma3 1b LoRA DPO
+
+# Known Issues
+- [ ] Fix mutli-gpu training for LoRA
