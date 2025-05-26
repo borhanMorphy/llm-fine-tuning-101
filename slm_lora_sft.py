@@ -3,7 +3,7 @@ import argparse
 import os
 import json
 from jinja2 import Template
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from copy import deepcopy
 from tqdm import tqdm
 from functools import partial
@@ -16,6 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor, LongTensor, BoolTensor
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 ## ------------------- Data ------------------- ##
 
@@ -94,6 +96,24 @@ def dynamic_collate_fn(all_token_ids, pad_token_id: int = 0, ignore_index: int =
     batch_attn_mask = torch.stack(batch_attn_mask)
 
     return batch_input_ids, batch_targets, batch_attn_mask
+
+
+## ------------------- Multi GPU ------------------- ##
+
+
+@dataclass
+class MultiGPUConfig:
+    rank: int = field(default=lambda: int(os.environ["RANK"]))
+    local_rank: int = field(default=lambda: int(os.environ["LOCAL_RANK"]))
+    world_size: int = field(default=lambda: int(os.environ["WORLD_SIZE"]))
+
+
+def ddp_setup(rank: int, world_size: int):
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def ddp_destroy():
+    torch.distributed.destroy_process_group()
 
 
 ## ------------------- Tokenization ------------------- ##
@@ -592,11 +612,7 @@ class SmolLM2(nn.Module):
 
 class LoRALinear(nn.Module):
     def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        rank: int,
-        alpha: float = 1.0
+        self, in_features: int, out_features: int, rank: int, alpha: float = 1.0
     ):
         super().__init__()
         assert rank < min(in_features, out_features), (
@@ -619,7 +635,7 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return ((x @ self.A) @ self.B) * self.scaler
-    
+
     def extra_repr(self) -> str:
         return f"in_features={self.in_features}, out_features={self.out_features}, rank={self.rank}, scaler={self.scaler}"
 
@@ -633,7 +649,8 @@ class CombinedLinear(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.full_rank_linear(x) + self.low_rank_linear(x)
 
-class LoraAdaptor():
+
+class LoraAdaptor:
     def __init__(self, model: SmolLM2, rank: int, alpha: float = 1.0):
         super().__init__()
         self.rank = rank
@@ -684,14 +701,13 @@ class LoraAdaptor():
                 state_dict[key] = value
         return state_dict
 
+
 ## ------------------- Optimization ------------------- ##
 
 
 def training_loop(
     model: SmolLM2, dl, criterion, optimizer, device, verbosity: int = 10
 ) -> float:
-    model.train()
-
     total_loss = []
     accumulated_loss = []
     for batch, targets, attn_mask in tqdm(dl):
@@ -727,7 +743,6 @@ def test_loop(model, dl, criterion, device) -> float:
 
 @torch.no_grad()
 def _non_training_loop(model, dl, criterion, device) -> float:
-    model.eval()
     total_loss = []
     for batch, targets, attn_mask in tqdm(dl):
         logits = model(batch.to(device), attention_mask=attn_mask.to(device))
@@ -747,8 +762,6 @@ def sample(
     device: str,
     max_tokens: int = 50,
 ) -> Generator[str, None, None]:
-    model.eval()
-
     input_raw = tokenizer.apply_chat_template(messages)
     print("prompt;\n", input_raw)
     input_tokens: List[int] = tokenizer(input_raw)
@@ -803,11 +816,21 @@ def main(args):
     dtype = torch.bfloat16
     num_available_gpus: int = torch.cuda.device_count()
     is_multi_gpu_training: bool = num_available_gpus > 1 and device.startswith("cuda")
+    multi_gpu_config: MultiGPUConfig = None
 
     model = SmolLM2.from_checkpoint(os.path.join(model_path, f"{model_name}-it.ckpt"))
+    model.eval()
+
     if is_multi_gpu_training:
-        print(f"{num_available_gpus} GPUs found, switching to nn.DataParallel")
-        model = nn.DataParallel(model)
+        print(f"{num_available_gpus} GPUs found, switching to DDP")
+        multi_gpu_config = MultiGPUConfig()
+        torch.cuda.set_device(multi_gpu_config.local_rank)
+        ddp_setup(multi_gpu_config.rank, multi_gpu_config.world_size)
+        device: str = f"cuda:{multi_gpu_config.local_rank}"
+        model.to(device)
+        model = DDP(model, device_ids=[multi_gpu_config.local_rank])
+
+    is_master = (not is_multi_gpu_training) or (torch.distributed.get_rank() == 0)
 
     lora_adaptor = LoraAdaptor(model, args.rank, alpha=args.alpha)
 
@@ -829,24 +852,48 @@ def main(args):
         ignore_index=ignore_index,
     )
 
+    train_sampler = None
+    val_sampler = None
+    test_sampler = None
+
+    if is_multi_gpu_training:
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=multi_gpu_config.world_size,
+            rank=multi_gpu_config.rank,
+        )
+        val_sampler = DistributedSampler(
+            val_ds,
+            num_replicas=multi_gpu_config.world_size,
+            rank=multi_gpu_config.rank,
+        )
+        test_sampler = DistributedSampler(
+            test_ds,
+            num_replicas=multi_gpu_config.world_size,
+            rank=multi_gpu_config.rank,
+        )
+
     train_dl = DataLoader(
         train_ds,
         batch_size=batch_size,
         collate_fn=collate_fn,
-        shuffle=True,
+        shuffle=train_sampler is None,
         num_workers=args.num_process,
+        sampler=train_sampler,
     )
     val_dl = DataLoader(
         val_ds,
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=args.num_process,
+        sampler=val_sampler,
     )
     test_dl = DataLoader(
         test_ds,
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=args.num_process,
+        sampler=test_sampler,
     )
 
     criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
@@ -857,26 +904,36 @@ def main(args):
     )
 
     best_val_loss = math.inf
+    num_infer_samples: int = 3
 
     for i in range(epoch):
-        print("running random 5 samples from validation set to sanity check")
-        print("---" * 20)
-        # get random samples
-        ids = random.sample(list(range(len(val_ds))), k=5)
-        for idx in ids:
-            system_message, user_message, _ = deepcopy(val_ds._data[idx])
-            print("Response;")
-            for token in sample(
-                model, tokenizer, (system_message, user_message), device, max_tokens=100
-            ):
-                print(token, flush=True, end="")
-            print()
-        print("---" * 20)
+        if is_master:
+            print(
+                f"running random {num_infer_samples} samples from validation set to sanity check"
+            )
+            print("---" * 20)
+            # get random samples
+            ids = random.sample(list(range(len(val_ds))), k=num_infer_samples)
+            for idx in ids:
+                system_message, user_message, _ = deepcopy(val_ds._data[idx])
+                print("Response;")
+                for token in sample(
+                    model,
+                    tokenizer,
+                    (system_message, user_message),
+                    device,
+                    max_tokens=100,
+                ):
+                    print(token, flush=True, end="")
+                print()
+            print("---" * 20)
         train_loss = training_loop(model, train_dl, criterion, optimizer, device)
-        print(f"[{i + 1}/{epoch}] Epoch | Training Loss : {train_loss:.3f}")
+        if is_master:
+            print(f"[{i + 1}/{epoch}] Epoch | Training Loss : {train_loss:.3f}")
         val_loss = validation_loop(model, val_dl, criterion, device)
-        print(f"[{i + 1}/{epoch}] Epoch | Validation Loss : {val_loss:.3f}")
-        if val_loss < best_val_loss:
+        if is_master:
+            print(f"[{i + 1}/{epoch}] Epoch | Validation Loss : {val_loss:.3f}")
+        if val_loss < best_val_loss and is_master:
             print(
                 f"Found a better model {best_val_loss:.2f} -> {val_loss:.2f}, saving..."
             )
@@ -888,7 +945,11 @@ def main(args):
             )
 
     test_loss = test_loop(model, test_dl, criterion, device)
-    print(f"Test Loss : {test_loss:.3f}")
+    if is_master:
+        print(f"Test Loss : {test_loss:.3f}")
+
+    if is_multi_gpu_training:
+        ddp_destroy()
 
 
 if __name__ == "__main__":
