@@ -1,9 +1,9 @@
-from typing import Literal, List, Dict, Tuple, Optional, Generator
+from typing import Literal, List, Dict, Tuple, Optional, Generator, Iterator
 import argparse
 import os
 import json
 from jinja2 import Template
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from copy import deepcopy
 from tqdm import tqdm
 from functools import partial
@@ -22,6 +22,8 @@ from torch.nn.attention.flex_attention import (
 )
 from torch import Tensor, LongTensor, BoolTensor
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 ## ------------------- Data ------------------- ##
 
@@ -98,6 +100,20 @@ def dynamic_collate_fn(all_token_ids, pad_token_id: int = 0, ignore_index: int =
 
     return batch_input_ids, batch_targets, batch_padding_mask
 
+
+## ------------------- Multi GPU ------------------- ##
+
+@dataclass
+class MultiGPUConfig:
+    rank: int = field(default=lambda : int(os.environ["RANK"]))
+    local_rank: int = field(default=lambda : int(os.environ["LOCAL_RANK"]))
+    world_size: int = field(default=lambda : int(os.environ["WORLD_SIZE"]))
+
+def ddp_setup(rank: int, world_size: int):
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def ddp_destroy():
+    torch.distributed.destroy_process_group()
 
 ## ------------------- Tokenization ------------------- ##
 
@@ -297,96 +313,6 @@ class ModelConfig:
     mlp_inter_hidden_size: int
     mlp_bias: bool
 
-
-class LoRALinear(nn.Module):
-    def __init__(
-        self, in_features: int, out_features: int, rank: int, alpha: float = 1.0
-    ):
-        super().__init__()
-        assert rank < min(in_features, out_features), (
-            "rank must be way smaller than original features"
-        )
-        self.A = nn.Parameter(torch.randn(size=(in_features, rank)), requires_grad=True)
-        self.B = nn.Parameter(
-            torch.zeros(size=(rank, out_features)), requires_grad=True
-        )
-        self.register_buffer("scaler", torch.tensor(alpha / rank))
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.A.data.normal_(mean=0, std=1)
-        self.B.data.fill_(0)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return ((x @ self.A) @ self.B) * self.scaler
-
-
-class LoraAdaptor:
-    def __init__(self, rank: int, alpha: float = 1.0):
-        self.rank = rank
-        self.alpha = alpha
-        self._layers: List[Tuple[str, nn.Linear, LoRALinear]] = []
-
-    def state_dict(self) -> OrderedDict:
-        state_dict = OrderedDict()
-        for name, _, lora_layer in self._layers:
-            for key, weight in lora_layer.state_dict().items():
-                full_name = ".".join([name, key])
-                state_dict[full_name] = weight
-        return state_dict
-
-    @staticmethod
-    def get_updated_forward(linear_layer: nn.Linear, lora_layer: LoRALinear):
-        def updated_forward(x: Tensor):
-            h = lora_layer(x)
-            return F.linear(x, linear_layer.weight, linear_layer.bias) + h
-
-        return updated_forward
-
-    def register_layers(self, model: nn.Module, layer_types=None):
-        assert layer_types is not None
-
-        for name, module in model.named_modules():
-            if not isinstance(module, layer_types):
-                continue
-
-            linear_layers = filter(
-                lambda sub_module: isinstance(sub_module[1], nn.Linear),
-                module.named_modules(),
-            )
-
-            for subname, linear_layer in linear_layers:
-                # get the full name
-                full_name = ".".join([name, subname])
-                # define the lora layer
-                lora_layer = LoRALinear(
-                    linear_layer.in_features,
-                    linear_layer.out_features,
-                    self.rank,
-                    alpha=self.alpha,
-                )
-                # replace linear layer forward
-                linear_layer.forward = self.get_updated_forward(
-                    linear_layer, lora_layer
-                )
-                # register it
-                self._layers.append((full_name, linear_layer, lora_layer))
-
-    def get_layers(self) -> Generator[Tuple[str, LoRALinear], None, None]:
-        for name, _, layer in self._layers:
-            if isinstance(layer, LoRALinear):
-                yield name, layer
-
-    def merge_layers(self):
-        # TODO
-        raise NotImplementedError("`merge_layers(...)` not yet implemented")
-
-    def load_state_dict(self):
-        # TODO
-        raise NotImplementedError("`load_state_dict(...)` not yet implemented")
-
-
 class MLP(nn.Module):
     # ref: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/modeling_gemma3.py#L147
 
@@ -464,7 +390,7 @@ class RoPEMultiHeadAttentionWithGQA(nn.Module):
         self,
         x: Tensor,
         pos_embeddings: Tuple[Tensor, Tensor],
-        padding_mask: Optional[Tensor] = None,
+        padding_mask: Optional[BoolTensor] = None,
     ) -> Tensor:
         """_summary_
 
@@ -529,28 +455,26 @@ class RoPEMultiHeadAttentionWithGQA(nn.Module):
         ).unflatten(dim=0, sizes=(batch_size, self.num_kv_heads))
         # k: B x nkv x S x d_h
 
-        # get causal masking mod
-        attn_mask_mod = self._causal_mask_mod()
+        masks = []
+
+        # add causal mask
+        masks.append(self._causal_mask_mod())
 
         # add sliding masking if needed
         if self.is_sliding:
-            attn_mask_mod = and_masks(
-                attn_mask_mod,
-                self._sliding_window_mask_mod(self.window_size),
-            )
+            masks.append(self._sliding_window_mask_mod(self.window_size))
 
         # add padding masking if exists
         padding_exists = padding_mask is not None
         if padding_exists:
-            attn_mask_mod = and_masks(
-                attn_mask_mod,
-                self._padding_mask_mod(padding_mask),
-            )
+            masks.append(self._padding_mask_mod(padding_mask))
+
+        attn_mask_mod = and_masks(*masks)
 
         # construct the block mask
         block_mask: BlockMask = create_block_mask(
             mask_mod=attn_mask_mod,
-            B=batch_size if padding_exists else None,  # only if padding exists
+            B=batch_size,
             H=None,
             Q_LEN=seq_len,
             KV_LEN=seq_len,
@@ -825,14 +749,107 @@ class Gemma3(nn.Module):
         return model
 
 
+class LoRALinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        alpha: float = 1.0
+    ):
+        super().__init__()
+        assert rank < min(in_features, out_features), (
+            "rank must be way smaller than original features"
+        )
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.A = nn.Parameter(torch.randn(size=(in_features, rank)), requires_grad=True)
+        self.B = nn.Parameter(
+            torch.zeros(size=(rank, out_features)), requires_grad=True
+        )
+        self.register_buffer("scaler", torch.tensor(alpha / rank), persistent=True)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.A.data.normal_(mean=0, std=1)
+        self.B.data.fill_(0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return ((x @ self.A) @ self.B) * self.scaler
+    
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, rank={self.rank}, scaler={self.scaler}"
+
+
+class CombinedLinear(nn.Module):
+    def __init__(self, full_rank_linear: nn.Linear, low_rank_linear: LoRALinear):
+        super().__init__()
+        self.full_rank_linear = full_rank_linear
+        self.low_rank_linear = low_rank_linear
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.full_rank_linear(x) + self.low_rank_linear(x)
+
+class LoraAdaptor():
+    def __init__(self, model: Gemma3, rank: int, alpha: float = 1.0):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.model = model
+
+    def register_layers(self, layer_types=None):
+        assert layer_types is not None
+
+        for name, module in self.model.named_modules():
+            if not isinstance(module, layer_types):
+                continue
+
+            linear_layers = filter(
+                lambda sub_module: isinstance(sub_module[1], nn.Linear),
+                module.named_modules(),
+            )
+
+            for subname, linear_layer in linear_layers:
+                # define the lora layer
+                lora_layer = LoRALinear(
+                    linear_layer.in_features,
+                    linear_layer.out_features,
+                    self.rank,
+                    alpha=self.alpha,
+                )
+                setattr(module, subname, CombinedLinear(linear_layer, lora_layer))
+
+    def freeze_model(self):
+        # freeze all
+        self.model.requires_grad_(False)
+
+        # unfreeze lora weights
+        for name, param in self.model.named_parameters():
+            if "low_rank_linear" in name:
+                param.requires_grad_(True)
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        for name, param in self.model.named_parameters():
+            if "low_rank_linear" in name:
+                yield param
+
+    def state_dict(self) -> OrderedDict:
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        state_dict = OrderedDict()
+        for key, value in model.state_dict().items():
+            if "low_rank_linear" in key:
+                state_dict[key] = value
+        return state_dict
+
+
 ## ------------------- Optimization ------------------- ##
 
 
 def training_loop(
     model: Gemma3, dl, criterion, optimizer, device, verbosity: int = 10
 ) -> float:
-    model.train()
-
     total_loss = []
     accumulated_loss = []
     for batch, targets, padding_mask in tqdm(dl):
@@ -868,7 +885,6 @@ def test_loop(model, dl, criterion, device) -> float:
 
 @torch.no_grad()
 def _non_training_loop(model, dl, criterion, device) -> float:
-    model.eval()
     total_loss = []
     for batch, targets, padding_mask in tqdm(dl):
         logits = model(batch.to(device), padding_mask=padding_mask.to(device))
@@ -888,8 +904,6 @@ def sample(
     device: str,
     max_tokens: int = 50,
 ) -> Generator[str, None, None]:
-    model.eval()
-
     input_raw = tokenizer.apply_chat_template(messages)
     print("prompt;\n", input_raw)
     input_tokens: List[int] = tokenizer(input_raw)
@@ -899,12 +913,7 @@ def sample(
     generated_token_id = None
     generated_token_counter = 0
     while generated_token_id != tokenizer.eos_token_id:
-        seq_len = input_ids.shape[1]
-        attn_mask = torch.ones(
-            1, seq_len, seq_len, dtype=torch.bool, device=device
-        ).tril(diagonal=0)
-
-        logits = model(input_ids, attn_mask)
+        logits = model(input_ids)
         # logits: 1 x S x C
 
         probs = F.softmax(logits[:, -1, :], dim=1)
@@ -942,29 +951,32 @@ def main(args):
     )
     device: str = args.device
     dtype = torch.bfloat16
+    num_available_gpus: int = torch.cuda.device_count()
+    is_multi_gpu_training: bool = num_available_gpus > 1 and device.startswith("cuda")
+    multi_gpu_config: MultiGPUConfig = None
 
     model = Gemma3.from_checkpoint(os.path.join(model_path, f"{model_name}-it.ckpt"))
+    model.eval()
 
-    lora_adaptor = LoraAdaptor(args.rank, alpha=args.alpha)
+    if is_multi_gpu_training:
+        print(f"{num_available_gpus} GPUs found, switching to DDP")
+        multi_gpu_config = MultiGPUConfig()
+        torch.cuda.set_device(multi_gpu_config.local_rank)
+        ddp_setup(multi_gpu_config.rank, multi_gpu_config.world_size)
+        device: str = f"cuda:{multi_gpu_config.local_rank}"
+        model.to(device)
+        model = DDP(model, device_ids=[multi_gpu_config.local_rank])
 
-    lora_adaptor.register_layers(model, layer_types=(RoPEMultiHeadAttentionWithGQA,))
+    is_master = (not is_multi_gpu_training) or (torch.distributed.get_rank() == 0)
 
-    if ((num_available_gpus := torch.cuda.device_count()) > 1) and device.startswith(
-        "cuda"
-    ):
-        print(f"{num_available_gpus} GPUs found, switching to nn.DataParallel")
-        model = nn.DataParallel(model)
+    lora_adaptor = LoraAdaptor(model, args.rank, alpha=args.alpha)
+
+    lora_adaptor.register_layers(layer_types=(RoPEMultiHeadAttentionWithGQA,))
 
     model.to(device, dtype)
 
     # freeze the main model
-    model.requires_grad_(False)
-
-    lora_parameters = []
-
-    for name, layer in lora_adaptor.get_layers():
-        layer.to(device, dtype)
-        lora_parameters += list(layer.parameters())
+    lora_adaptor.freeze_model()
 
     learning_rate: float = args.learning_rate
     epoch: int = args.epoch
@@ -977,54 +989,70 @@ def main(args):
         ignore_index=ignore_index,
     )
 
+    train_sampler = None
+    val_sampler = None
+    test_sampler = None
+
+    if is_multi_gpu_training:
+        train_sampler = DistributedSampler(train_ds, num_replicas=multi_gpu_config.world_size, rank=multi_gpu_config.rank)
+        val_sampler = DistributedSampler(val_ds, num_replicas=multi_gpu_config.world_size, rank=multi_gpu_config.rank)
+        test_sampler = DistributedSampler(test_ds, num_replicas=multi_gpu_config.world_size, rank=multi_gpu_config.rank)
+
     train_dl = DataLoader(
         train_ds,
         batch_size=batch_size,
         collate_fn=collate_fn,
-        shuffle=True,
+        shuffle=train_sampler is None,
         num_workers=args.num_process,
+        sampler=train_sampler,
     )
     val_dl = DataLoader(
         val_ds,
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=args.num_process,
+        sampler=val_sampler,
     )
     test_dl = DataLoader(
         test_ds,
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=args.num_process,
+        sampler=test_sampler,
     )
 
     criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
 
     optimizer = torch.optim.AdamW(
-        lora_parameters,
+        lora_adaptor.parameters(),
         lr=learning_rate,
     )
 
     best_val_loss = math.inf
+    num_infer_samples: int = 1
 
     for i in range(epoch):
-        print("running random 5 samples from validation set to sanity check")
-        print("---" * 20)
-        # get random samples
-        ids = random.sample(list(range(len(val_ds))), k=5)
-        for idx in ids:
-            system_message, user_message, _ = deepcopy(val_ds._data[idx])
-            print("Response;")
-            for token in sample(
-                model, tokenizer, (system_message, user_message), device, max_tokens=100
-            ):
-                print(token, flush=True, end="")
-            print()
-        print("---" * 20)
+        if is_master:
+            print(f"running random {num_infer_samples} samples from validation set to sanity check")
+            print("---" * 20)
+            # get random samples
+            ids = random.sample(list(range(len(val_ds))), k=num_infer_samples)
+            for idx in ids:
+                system_message, user_message, _ = deepcopy(val_ds._data[idx])
+                print("Response;")
+                for token in sample(
+                    model, tokenizer, (system_message, user_message), device, max_tokens=100
+                ):
+                    print(token, flush=True, end="")
+                print()
+            print("---" * 20)
         train_loss = training_loop(model, train_dl, criterion, optimizer, device)
-        print(f"[{i + 1}/{epoch}] Epoch | Training Loss : {train_loss:.3f}")
+        if is_master:
+            print(f"[{i + 1}/{epoch}] Epoch | Training Loss : {train_loss:.3f}")
         val_loss = validation_loop(model, val_dl, criterion, device)
-        print(f"[{i + 1}/{epoch}] Epoch | Validation Loss : {val_loss:.3f}")
-        if val_loss < best_val_loss:
+        if is_master:
+            print(f"[{i + 1}/{epoch}] Epoch | Validation Loss : {val_loss:.3f}")
+        if val_loss < best_val_loss and is_master:
             print(
                 f"Found a better model {best_val_loss:.2f} -> {val_loss:.2f}, saving..."
             )
@@ -1036,7 +1064,11 @@ def main(args):
             )
 
     test_loss = test_loop(model, test_dl, criterion, device)
-    print(f"Test Loss : {test_loss:.3f}")
+    if is_master:
+        print(f"Test Loss : {test_loss:.3f}")
+
+    if is_multi_gpu_training:
+        ddp_destroy()
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
-from typing import Literal, List, Dict, Tuple, Optional, Generator
+from typing import Literal, List, Dict, Tuple, Optional, Generator, Iterator
 import argparse
 import os
 import json
 from jinja2 import Template
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from copy import deepcopy
 from tqdm import tqdm
 from functools import partial
@@ -289,95 +289,6 @@ class ModelConfig:
 
     mlp_inter_hidden_size: int
     mlp_bias: bool
-
-
-class LoRALinear(nn.Module):
-    def __init__(
-        self, in_features: int, out_features: int, rank: int, alpha: float = 1.0
-    ):
-        super().__init__()
-        assert rank < min(in_features, out_features), (
-            "rank must be way smaller than original features"
-        )
-        self.A = nn.Parameter(torch.randn(size=(in_features, rank)), requires_grad=True)
-        self.B = nn.Parameter(
-            torch.zeros(size=(rank, out_features)), requires_grad=True
-        )
-        self.register_buffer("scaler", torch.tensor(alpha / rank))
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.A.data.normal_(mean=0, std=1)
-        self.B.data.fill_(0)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return ((x @ self.A) @ self.B) * self.scaler
-
-
-class LoraAdaptor:
-    def __init__(self, rank: int, alpha: float = 1.0):
-        self.rank = rank
-        self.alpha = alpha
-        self._layers: List[Tuple[str, nn.Linear, LoRALinear]] = []
-
-    def state_dict(self) -> OrderedDict:
-        state_dict = OrderedDict()
-        for name, _, lora_layer in self._layers:
-            for key, weight in lora_layer.state_dict().items():
-                full_name = ".".join([name, key])
-                state_dict[full_name] = weight
-        return state_dict
-
-    @staticmethod
-    def get_updated_forward(linear_layer: nn.Linear, lora_layer: LoRALinear):
-        def updated_forward(x: Tensor):
-            h = lora_layer(x)
-            return F.linear(x, linear_layer.weight, linear_layer.bias) + h
-
-        return updated_forward
-
-    def register_layers(self, model: nn.Module, layer_types=None):
-        assert layer_types is not None
-
-        for name, module in model.named_modules():
-            if not isinstance(module, layer_types):
-                continue
-
-            linear_layers = filter(
-                lambda sub_module: isinstance(sub_module[1], nn.Linear),
-                module.named_modules(),
-            )
-
-            for subname, linear_layer in linear_layers:
-                # get the full name
-                full_name = ".".join([name, subname])
-                # define the lora layer
-                lora_layer = LoRALinear(
-                    linear_layer.in_features,
-                    linear_layer.out_features,
-                    self.rank,
-                    alpha=self.alpha,
-                )
-                # replace linear layer forward
-                linear_layer.forward = self.get_updated_forward(
-                    linear_layer, lora_layer
-                )
-                # register it
-                self._layers.append((full_name, linear_layer, lora_layer))
-
-    def get_layers(self) -> Generator[Tuple[str, LoRALinear], None, None]:
-        for name, _, layer in self._layers:
-            if isinstance(layer, LoRALinear):
-                yield name, layer
-
-    def merge_layers(self):
-        # TODO
-        raise NotImplementedError("`merge_layers(...)` not yet implemented")
-
-    def load_state_dict(self):
-        # TODO
-        raise NotImplementedError("`load_state_dict(...)` not yet implemented")
 
 
 class MLP(nn.Module):
@@ -679,6 +590,100 @@ class SmolLM2(nn.Module):
         return model
 
 
+class LoRALinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        alpha: float = 1.0
+    ):
+        super().__init__()
+        assert rank < min(in_features, out_features), (
+            "rank must be way smaller than original features"
+        )
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.A = nn.Parameter(torch.randn(size=(in_features, rank)), requires_grad=True)
+        self.B = nn.Parameter(
+            torch.zeros(size=(rank, out_features)), requires_grad=True
+        )
+        self.register_buffer("scaler", torch.tensor(alpha / rank), persistent=True)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.A.data.normal_(mean=0, std=1)
+        self.B.data.fill_(0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return ((x @ self.A) @ self.B) * self.scaler
+    
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, rank={self.rank}, scaler={self.scaler}"
+
+
+class CombinedLinear(nn.Module):
+    def __init__(self, full_rank_linear: nn.Linear, low_rank_linear: LoRALinear):
+        super().__init__()
+        self.full_rank_linear = full_rank_linear
+        self.low_rank_linear = low_rank_linear
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.full_rank_linear(x) + self.low_rank_linear(x)
+
+class LoraAdaptor():
+    def __init__(self, model: SmolLM2, rank: int, alpha: float = 1.0):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.model = model
+
+    def register_layers(self, layer_types=None):
+        assert layer_types is not None
+
+        for name, module in self.model.named_modules():
+            if not isinstance(module, layer_types):
+                continue
+
+            linear_layers = filter(
+                lambda sub_module: isinstance(sub_module[1], nn.Linear),
+                module.named_modules(),
+            )
+
+            for subname, linear_layer in linear_layers:
+                # define the lora layer
+                lora_layer = LoRALinear(
+                    linear_layer.in_features,
+                    linear_layer.out_features,
+                    self.rank,
+                    alpha=self.alpha,
+                )
+                setattr(module, subname, CombinedLinear(linear_layer, lora_layer))
+
+    def freeze_model(self):
+        # freeze all
+        self.model.requires_grad_(False)
+
+        # unfreeze lora weights
+        for name, param in self.model.named_parameters():
+            if "low_rank_linear" in name:
+                param.requires_grad_(True)
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        for name, param in self.model.named_parameters():
+            if "low_rank_linear" in name:
+                yield param
+
+    def state_dict(self) -> OrderedDict:
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        state_dict = OrderedDict()
+        for key, value in model.state_dict().items():
+            if "low_rank_linear" in key:
+                state_dict[key] = value
+        return state_dict
+
 ## ------------------- Optimization ------------------- ##
 
 
@@ -796,29 +801,22 @@ def main(args):
     )
     device: str = args.device
     dtype = torch.bfloat16
+    num_available_gpus: int = torch.cuda.device_count()
+    is_multi_gpu_training: bool = num_available_gpus > 1 and device.startswith("cuda")
 
     model = SmolLM2.from_checkpoint(os.path.join(model_path, f"{model_name}-it.ckpt"))
-
-    lora_adaptor = LoraAdaptor(args.rank, alpha=args.alpha)
-
-    lora_adaptor.register_layers(model, layer_types=(RoPEMultiHeadAttentionWithGQA,))
-
-    if ((num_available_gpus := torch.cuda.device_count()) > 1) and device.startswith(
-        "cuda"
-    ):
+    if is_multi_gpu_training:
         print(f"{num_available_gpus} GPUs found, switching to nn.DataParallel")
         model = nn.DataParallel(model)
+
+    lora_adaptor = LoraAdaptor(model, args.rank, alpha=args.alpha)
+
+    lora_adaptor.register_layers(layer_types=(RoPEMultiHeadAttentionWithGQA,))
 
     model.to(device, dtype)
 
     # freeze the main model
-    model.requires_grad_(False)
-
-    lora_parameters = []
-
-    for name, layer in lora_adaptor.get_layers():
-        layer.to(device, dtype)
-        lora_parameters += list(layer.parameters())
+    lora_adaptor.freeze_model()
 
     learning_rate: float = args.learning_rate
     epoch: int = args.epoch
@@ -854,7 +852,7 @@ def main(args):
     criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
 
     optimizer = torch.optim.AdamW(
-        lora_parameters,
+        lora_adaptor.parameters(),
         lr=learning_rate,
     )
 

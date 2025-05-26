@@ -706,12 +706,12 @@ def main(args):
     )
     device: str = args.device
     dtype = torch.bfloat16
+    num_available_gpus: int = torch.cuda.device_count()
+    is_multi_gpu_training: bool = num_available_gpus > 1 and device.startswith("cuda")
 
     model = SmolLM2.from_checkpoint(os.path.join(model_path, f"{model_name}-it.ckpt"))
 
-    if ((num_available_gpus := torch.cuda.device_count()) > 1) and device.startswith(
-        "cuda"
-    ):
+    if is_multi_gpu_training:
         print(f"{num_available_gpus} GPUs found, switching to nn.DataParallel")
         model = nn.DataParallel(model)
 
@@ -780,7 +780,7 @@ def main(args):
                 f"Found a better model {best_val_loss:.2f} -> {val_loss:.2f}, saving..."
             )
             best_val_loss = val_loss
-            if num_available_gpus > 1:
+            if is_multi_gpu_training:
                 config = asdict(model.module.config)
                 weights = model.module.state_dict()
             else:
