@@ -6,7 +6,7 @@
 - [x] Start Implementing Decoder Layer
     - [x] MHA with RoPE
     - [x] MLP
-- [x] Create a config file for smollm2
+- [x] Create a config file for Smollm2
 - [x] Port weights and sanity check
 - [x] Port tokenizer vocab and update chat template
 - [x] Run tokenizer on the full dataset for sanity
@@ -33,16 +33,18 @@
 - [x] Understand DPO
     - [x] Math-wise
     - [x] Code-wise
-- [ ] Create a dataset for DPO
-- [ ] Implement DPO
-- [ ] Traing with DPO
 - [x] Implement Gemma3 1b
     - [x] Port tokenizer vocab and update chat template
     - [x] Implement sliding window attention via flex attention
     - [x] Sanity check of whole implementation
     - [x] Weight porting script and sanity check
+- [x] Switch from DP -> DDP
 - [ ] Training with Gemma3 1b LoRA SFT
+- [ ] Create a dataset for DPO
+- [ ] Implement DPO
+- [ ] Traing with DPO
 - [ ] Training with Gemma3 1b LoRA DPO
+- [ ] Training with Smollm2 1b LoRA DPO
 
 # Known Issues
-- [ ] Fix mutli-gpu training for LoRA
+- [x] Fix mutli-gpu training for LoRA
