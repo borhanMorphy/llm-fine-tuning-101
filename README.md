@@ -22,9 +22,9 @@ Welcome to the **LLM Fine-Tuning Educational Repository**, built entirely with *
 .
 ├── demo/                 # Markdowns for demos
 ├── scripts/              # Utility scripts
-├── slm_full_sft.py       # Full Fine-Tuning Smollm2
-├── slm_lora_sft.py       # Fine-Tuning Smollm2 via LoRA
-├── llm_lora_sft.py       # Fine-Tuning Gemma3 via LoRA 
+├── slm_full_sft.py       # Supervised Full Fine-Tuning Smollm2
+├── slm_lora_sft.py       # Supervised Fine-Tuning Smollm2 via LoRA
+├── llm_lora_sft.py       # Supervised Fine-Tuning Gemma3 via LoRA
 └── README.md             # This file
 ```
 
