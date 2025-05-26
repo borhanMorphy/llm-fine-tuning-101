@@ -103,9 +103,9 @@ def dynamic_collate_fn(all_token_ids, pad_token_id: int = 0, ignore_index: int =
 
 @dataclass
 class MultiGPUConfig:
-    rank: int = field(default=lambda: int(os.environ["RANK"]))
-    local_rank: int = field(default=lambda: int(os.environ["LOCAL_RANK"]))
-    world_size: int = field(default=lambda: int(os.environ["WORLD_SIZE"]))
+    rank: int = field(default_factory=lambda: int(os.environ["RANK"]))
+    local_rank: int = field(default_factory=lambda: int(os.environ["LOCAL_RANK"]))
+    world_size: int = field(default_factory=lambda: int(os.environ["WORLD_SIZE"]))
 
 
 def ddp_setup(rank: int, world_size: int):
@@ -448,6 +448,7 @@ class DecoderLayer(nn.Module):
             config.num_q_heads,
             config.num_kv_heads,
             bias=config.attention_bias,
+            dropout=0.0,
         )
 
         self.mlp = MLP(
@@ -941,7 +942,10 @@ def main(args):
 
             torch.save(
                 lora_adaptor.state_dict(),
-                os.path.join(model_path, f"{model_name}-best-lora-sft.pt"),
+                os.path.join(
+                    model_path,
+                    f"{model_name}-best-lora-rank-{lora_adaptor.rank}-sft.pt",
+                ),
             )
 
     test_loss = test_loop(model, test_dl, criterion, device)
