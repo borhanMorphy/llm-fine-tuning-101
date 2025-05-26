@@ -20,8 +20,10 @@ Welcome to the **LLM Fine-Tuning Educational Repository**, built entirely with *
 
 ```
 .
-├── notebooks/            # Jupyter notebooks for tutorials and experiments
+├── demo/                 # Markdowns for demos
 ├── scripts/              # Utility scripts
+├── slm_full_sft.py       # Full Fine-Tuning Smollm2
+├── slm_lora_sft.py       # Fine-Tuning Smollm2 via LoRA
 ├── llm_lora_sft.py       # Fine-Tuning Gemma3 via LoRA 
 └── README.md             # This file
 ```
