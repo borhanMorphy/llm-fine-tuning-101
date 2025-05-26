@@ -10,7 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.append(os.getcwd())
 
-from slm_full_sft import SmolLM2, ModelConfig
+from slm_lora_sft import SmolLM2, ModelConfig
 
 
 CHAT_TEMPLATE = """<|im_start|>system
