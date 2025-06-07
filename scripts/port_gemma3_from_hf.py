@@ -28,7 +28,7 @@ MODEL_NAME_TO_HF_CHECKPOINT = {
 }
 
 
-def port_weights_from_hf(checkpoint: str, model_name: str, target_path: str):
+def port_weights_from_hf(checkpoint: str, model_name: str, target_path: str, max_seq_len: int):
     device = "cpu"
     dtype = torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(checkpoint).to(device, dtype)
@@ -38,15 +38,23 @@ def port_weights_from_hf(checkpoint: str, model_name: str, target_path: str):
     seq_len: int = 50
 
     input_ids = torch.randint(3, 1000, size=(batch_size, seq_len))
+    attn_mask = torch.ones(batch_size, seq_len, seq_len, dtype=torch.bool).tril(
+        diagonal=0
+    )
+    attn_weights = torch.zeros(batch_size, 1, seq_len, seq_len)
+    attn_weights.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float("-inf"))
 
     original_st = model.state_dict()
+
+    original_max_seq_len = 2**15 # 32k for 1b gemma3
+
+    max_seq_len = min(original_max_seq_len, max_seq_len)
 
     config = ModelConfig(
         hidden_size=model.config.hidden_size,
         vocab_size=model.config.vocab_size,
         num_layers=model.config.num_hidden_layers,
-        max_seq_len=model.config.max_position_embeddings
-        // 2**3,  # clipping a bit since we do not need 32k seq len
+        max_seq_len=max_seq_len,
         rope_global_theta=model.config.rope_theta,
         rope_local_theta=model.config.rope_local_base_freq,
         head_dim=model.config.head_dim,
@@ -54,7 +62,7 @@ def port_weights_from_hf(checkpoint: str, model_name: str, target_path: str):
         num_kv_heads=model.config.num_key_value_heads,
         attention_bias=model.config.attention_bias,
         is_sliding_attention=[
-            layer_type == "sliding_attention" for layer_type in model.config.layer_types
+            layer.self_attn.is_sliding for layer in model.model.layers
         ],
         window_size=model.config.sliding_window,
         padding_idx=model.config.pad_token_id,
@@ -76,7 +84,7 @@ def port_weights_from_hf(checkpoint: str, model_name: str, target_path: str):
     new_model.load_state_dict(final_st)
 
     with torch.no_grad():
-        r1 = model(input_ids)
+        r1 = model(input_ids, attention_mask=attn_weights)
         r2 = new_model(input_ids)
 
     print((r1.logits - r2).abs().mean())
@@ -129,8 +137,8 @@ def main(args):
 
     os.makedirs(args.target_path, exist_ok=True)
 
-    # port_tokenizer_from_hf(checkpoint, args.model_name, args.target_path)
-    port_weights_from_hf(checkpoint, args.model_name, args.target_path)
+    port_tokenizer_from_hf(checkpoint, args.model_name, args.target_path)
+    port_weights_from_hf(checkpoint, args.model_name, args.target_path, args.max_seq_len)
 
 
 if __name__ == "__main__":
@@ -143,4 +151,5 @@ if __name__ == "__main__":
         choices=list(MODEL_NAME_TO_HF_CHECKPOINT.keys()),
     )
     ap.add_argument("--target-path", "-t", type=str, default="artifacts")
+    ap.add_argument("--max-seq-len", "-msq", type=int, default=2**12)
     main(ap.parse_args())
