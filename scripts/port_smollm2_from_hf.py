@@ -10,19 +10,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.append(os.getcwd())
 
-from slm_lora_sft import SmolLM2, ModelConfig
+from slm_full_sft import SmolLM2, ModelConfig
 
 
-CHAT_TEMPLATE = """<|im_start|>system
-{{ messages[0]['content'] | trim }}
+CHAT_TEMPLATE = """
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] | trim }}
 <|im_end|>
-<|im_start|>user
-{{ messages[1]['content'] | trim }}
-<|im_end|>
+{%- endfor %}
+{%- if messages[-1]['role'] != 'assistant' %}
 <|im_start|>assistant
-{% if messages|length > 2 and messages[2]['content'] -%}
-{{ messages[2]['content'] | trim }}
-<|im_end|>
 {%- endif %}
 """
 
@@ -59,7 +57,7 @@ def port_weights_from_hf(checkpoint: str, model_name: str, target_path: str):
     model = AutoModelForCausalLM.from_pretrained(checkpoint).to(device, dtype)
     model.eval()
     batch_size: int = 1
-    seq_len: int = 10
+    seq_len: int = 50
 
     input_ids = torch.randint(3, 1000, size=(batch_size, seq_len))
     attn_mask = torch.ones(batch_size, seq_len, seq_len, dtype=torch.bool).tril(
@@ -101,8 +99,9 @@ def port_weights_from_hf(checkpoint: str, model_name: str, target_path: str):
 
     with torch.no_grad():
         r1 = model(input_ids, attention_mask=attn_weights)
-        r2 = new_model(input_ids, attention_mask=attn_mask)
+        r2 = new_model(input_ids)
 
+    # slight difference is coming from half precision, if fp32 is used, no issue.
     print((r1.logits - r2).abs().mean())
 
     ckpt = {

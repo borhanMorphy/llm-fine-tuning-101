@@ -23,8 +23,7 @@
 - [x] Clean the code
 - [x] Fix the data
 - [x] Support multi-gpu
-- [ ] Retrained the model after fixing the data
-- [ ] Export to vLLM offline (managed kv cache?)
+- [x] Retrained the model after fixing the data
 - [x] Understand LoRAç
     - [x] Math-wise
     - [x] Code-wise
@@ -39,7 +38,11 @@
     - [x] Sanity check of whole implementation
     - [x] Weight porting script and sanity check
 - [x] Switch from DP -> DDP
-- [ ] Training with Gemma3 1b LoRA SFT
+- [x] Training with Gemma3 1b LoRA SFT
+- [x] Add KV cache
+- [x] Support multi-turn conversation
+- [ ] Truncate sequence rather than being dynamic to avoid OOM
+- [ ] Add inference script
 - [ ] Create a dataset for DPO
 - [ ] Implement DPO
 - [ ] Traing with DPO
