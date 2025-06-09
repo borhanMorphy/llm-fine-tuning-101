@@ -399,7 +399,7 @@ class RoPEMultiHeadAttentionWithGQA(nn.Module):
             padding_mask (Optional[BoolTensor], optional): B x S mask if exists, True means it is padded. Defaults to None.
 
         Returns:
-            BoolTensor: Final attention mask with shape of B x S x S_full
+            BoolTensor: Final attention mask with shape of B x 1 x S x S_full
         """
 
         attn_mask: BoolTensor = torch.ones(
@@ -418,7 +418,7 @@ class RoPEMultiHeadAttentionWithGQA(nn.Module):
             attn_mask.masked_fill_(padding_mask.unsqueeze(1), False)
             # attn_mask: B x S x S
 
-        return attn_mask
+        return attn_mask.unsqueeze(1)
 
     def forward(
         self,
