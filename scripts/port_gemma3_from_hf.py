@@ -28,7 +28,9 @@ MODEL_NAME_TO_HF_CHECKPOINT = {
 }
 
 
-def port_weights_from_hf(checkpoint: str, model_name: str, target_path: str, max_seq_len: int):
+def port_weights_from_hf(
+    checkpoint: str, model_name: str, target_path: str, max_seq_len: int
+):
     device = "cpu"
     dtype = torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(checkpoint).to(device, dtype)
@@ -46,7 +48,7 @@ def port_weights_from_hf(checkpoint: str, model_name: str, target_path: str, max
 
     original_st = model.state_dict()
 
-    original_max_seq_len = 2**15 # 32k for 1b gemma3
+    original_max_seq_len = 2**15  # 32k for 1b gemma3
 
     max_seq_len = min(original_max_seq_len, max_seq_len)
 
@@ -111,7 +113,7 @@ def port_tokenizer_from_hf(checkpoint: str, model_name: str, target_path: str):
 
     special_tokens = {
         "bos_token": tokenizer.bos_token,
-        "eos_token": tokenizer.eos_token,
+        "eos_token": "<end_of_turn>",
         "pad_token": tokenizer.pad_token,
         "unk_token": tokenizer.unk_token,
     }
@@ -138,7 +140,9 @@ def main(args):
     os.makedirs(args.target_path, exist_ok=True)
 
     port_tokenizer_from_hf(checkpoint, args.model_name, args.target_path)
-    port_weights_from_hf(checkpoint, args.model_name, args.target_path, args.max_seq_len)
+    port_weights_from_hf(
+        checkpoint, args.model_name, args.target_path, args.max_seq_len
+    )
 
 
 if __name__ == "__main__":

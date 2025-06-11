@@ -64,6 +64,32 @@ class InstructDataset(Dataset):
             messages = []
             for message in json.loads(sample_json):
                 messages.append(Message(**message))
+
+            # Sanity check
+            # TODO think about tool calling mb
+            assert len(messages) >= 3, (
+                "There should be at least 3 messages which belongs to `system`, `user` and `assistant`"
+            )
+            assert messages[0].role == "system", (
+                "First message in the dataset must be `system` message"
+            )
+            assert len(messages[1:]) % 2 == 0, (
+                "Number of messages after system message must be divisible by 2"
+            )
+            assert (
+                all(
+                    [
+                        message.role == "user"  # first message must be coming from user
+                        if i % 2 == 0
+                        else message.role
+                        == "assistant"  # last message must be coming from assistant
+                        for i, message in enumerate(messages[1:])
+                    ]
+                )
+                == True
+            ), (
+                "Sanity check failed for multi-turn messages, pattern must be system -> user -> assistant -> user -> assistant ..."
+            )
             data.append(messages)
 
         return cls(data, *args, **kwargs)
@@ -367,27 +393,34 @@ class RoPEMultiHeadAttentionWithGQA(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
 
+        self.reset_cache()
+
+    def reset_cache(self):
+        """Needs to be called manually when causal inference is done."""
+        self.k_cache = torch.empty((1, self.num_kv_heads, 0, self.head_dim))
+        self.v_cache = torch.empty((1, self.num_kv_heads, 0, self.head_dim))
+
     @staticmethod
-    def _sliding_window_mask_mod(window_size: int):
+    def _sliding_window_mask_mod(window_size: int, pos_offset: int = 0):
         # `True` means allow attention
         def _sliding_window(b, h, q_idx, kv_idx):
-            return (q_idx - kv_idx) <= window_size
+            return (q_idx + pos_offset - kv_idx) <= window_size
 
         return _sliding_window
 
     @staticmethod
-    def _causal_mask_mod():
+    def _causal_mask_mod(pos_offset: int = 0):
         # `True` means allow attention
         def _causal(b, h, q_idx, kv_idx):
-            return q_idx >= kv_idx
+            return (q_idx + pos_offset) >= kv_idx
 
         return _causal
 
     @staticmethod
-    def _padding_mask_mod(padding_mask: BoolTensor):
+    def _padding_mask_mod(padding_mask: BoolTensor, pos_offset: int = 0):
         # `True` means allow attention
         def _padding(b, h, q_idx, kv_idx):
-            return ~(padding_mask[b, q_idx] | padding_mask[b, kv_idx])
+            return ~(padding_mask[b, q_idx + pos_offset] | padding_mask[b, kv_idx])
 
         return _padding
 
@@ -396,18 +429,26 @@ class RoPEMultiHeadAttentionWithGQA(nn.Module):
         x: Tensor,
         pos_embeddings: Tuple[Tensor, Tensor],
         padding_mask: Optional[BoolTensor] = None,
+        use_cache: bool = False,
     ) -> Tensor:
-        """_summary_
+        """Causal MHA with RoPE and GQA
 
         Args:
             x (Tensor): B x S x d
             pos_embeddings (Tuple[Tensor, Tensor]): cos_theta with (S_max x d) shape and sin_theta with (S_max x d) shape
-            padding_mask (Optional[Tensor], optional): B x S mask if exists, True means it is padded. Defaults to None.
+            padding_mask (Optional[BoolTensor], optional): B x S mask if exists, True means it is padded. Defaults to None.
+            use_cache bool: whether to use KV cache or not
 
         Returns:
             Tensor: B x S x d
         """
         batch_size, seq_len, _ = x.shape
+
+        pos_offset: int = self.k_cache.shape[2]
+
+        assert (not use_cache) or (batch_size == 1), (
+            "If cache is enabled, only batch size 1 supported"
+        )
 
         q: Tensor = (
             self.q_proj(x)
@@ -446,11 +487,24 @@ class RoPEMultiHeadAttentionWithGQA(nn.Module):
         q: Tensor = self.q_norm(q)
         k: Tensor = self.k_norm(k)
 
+        if use_cache:
+            # register it to cache
+            self.k_cache = torch.cat([self.k_cache.to(k.device, k.dtype), k], dim=2)
+            # k_cache: B x nkv x S_full x d_h
+
+            # register it to cache
+            self.v_cache = torch.cat([self.v_cache.to(v.device, v.dtype), v], dim=2)
+            # v_cache: B x nkv x S_full x d_h
+
+            k = self.k_cache.clone()
+            v = self.v_cache.clone()
+
         cos_theta, sin_theta = pos_embeddings
         q = apply_rope_embed(
             q.flatten(start_dim=0, end_dim=1),
             cos_theta,
             sin_theta,
+            pos_offset=pos_offset,
         ).unflatten(dim=0, sizes=(batch_size, self.num_q_heads))
         # q: B x nh x S x d_h
         k = apply_rope_embed(
@@ -463,16 +517,18 @@ class RoPEMultiHeadAttentionWithGQA(nn.Module):
         masks = []
 
         # add causal mask
-        masks.append(self._causal_mask_mod())
+        masks.append(self._causal_mask_mod(pos_offset=pos_offset))
 
         # add sliding masking if needed
         if self.is_sliding:
-            masks.append(self._sliding_window_mask_mod(self.window_size))
+            masks.append(
+                self._sliding_window_mask_mod(self.window_size, pos_offset=pos_offset)
+            )
 
         # add padding masking if exists
         padding_exists = padding_mask is not None
         if padding_exists:
-            masks.append(self._padding_mask_mod(padding_mask))
+            masks.append(self._padding_mask_mod(padding_mask, pos_offset=pos_offset))
 
         attn_mask_mod = and_masks(*masks)
 
@@ -482,7 +538,7 @@ class RoPEMultiHeadAttentionWithGQA(nn.Module):
             B=batch_size,
             H=None,
             Q_LEN=seq_len,
-            KV_LEN=seq_len,
+            KV_LEN=seq_len + pos_offset,
             device=q.device,
         )
 
@@ -542,12 +598,15 @@ class DecoderLayer(nn.Module):
         x: Tensor,
         pos_embeddings: Tuple[Tensor, Tensor],
         padding_mask: BoolTensor = None,
+        use_cache: bool = False,
     ) -> Tensor:
         res = x
         x = self.input_layernorm(x)
 
         # self attention
-        x = self.self_attn(x, pos_embeddings, padding_mask=padding_mask)
+        x = self.self_attn(
+            x, pos_embeddings, padding_mask=padding_mask, use_cache=use_cache
+        )
 
         x = self.post_attention_layernorm(x)
         x = res + x
@@ -637,20 +696,26 @@ def rotate_half(x: Tensor) -> Tensor:
     return torch.cat((-x2, x1), dim=2)
 
 
-def apply_rope_embed(x: Tensor, cos_theta: Tensor, sin_theta: Tensor) -> Tensor:
+def apply_rope_embed(
+    x: Tensor, cos_theta: Tensor, sin_theta: Tensor, pos_offset: int = 0
+) -> Tensor:
     """Applies rope embedding with pre-computed cos_theta and sin_theta
 
     Args:
         x (Tensor): B x S x d
         cos_theta (Tensor): S_max x d
         sin_theta (Tensor): S_max x d
+        pos_offset (int, optional): Offset of the position due to KV cache. Defaults to 0.
 
     Returns:
         Tensor: B x S x d
     """
     seq_len = x.shape[1]
 
-    return x * cos_theta[:seq_len, :] + rotate_half(x) * sin_theta[:seq_len, :]
+    return (
+        x * cos_theta[pos_offset : pos_offset + seq_len, :]
+        + rotate_half(x) * sin_theta[pos_offset : pos_offset + seq_len, :]
+    )
 
 
 class ScaledEmbedding(nn.Embedding):
@@ -712,14 +777,12 @@ class Gemma3(nn.Module):
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(
+    def decoder(
         self,
-        input_ids: LongTensor,
+        x: Tensor,
         padding_mask: BoolTensor = None,
+        use_cache: bool = False,
     ) -> Tensor:
-        x: Tensor = self.embed_tokens(input_ids)
-        # x: B x S x d
-
         global_pos_embeddings: Tuple[Tensor, Tensor] = (
             self.rotary_emb_gobal.cos_theta,
             self.rotary_emb_gobal.sin_theta,
@@ -730,21 +793,90 @@ class Gemma3(nn.Module):
             self.rotary_emb_local.sin_theta,
         )
 
-        for i, decoder_layer in enumerate(self.layers):
+        for decoder_layer in self.layers:
             if decoder_layer.self_attn.is_sliding:
                 pos_embeddings = local_pos_embeddings
             else:
                 pos_embeddings = global_pos_embeddings
 
+        for decoder_layer in self.layers:
             x = decoder_layer(
-                x,
-                pos_embeddings,
-                padding_mask=padding_mask,
+                x, pos_embeddings, padding_mask=padding_mask, use_cache=use_cache
             )
 
         x = self.norm(x)
 
+        return x
+
+    def forward(
+        self,
+        input_ids: LongTensor,
+        padding_mask: BoolTensor = None,
+        use_cache: bool = False,
+    ) -> Tensor:
+        x: Tensor = self.embed_tokens(input_ids)
+        # x: B x S x d
+
+        x = self.decoder(x, padding_mask=padding_mask, use_cache=use_cache)
+
         return self.lm_head(x)
+
+    @torch.no_grad()
+    def sample(
+        self,
+        input_ids: LongTensor,
+        stop_token: int,
+        max_tokens: int = 200,
+        use_cache: bool = False,
+    ) -> Generator[LongTensor, None, None]:
+        """Causal sampling from LLM by utilising KV Cache
+
+        Args:
+            input_ids (LongTensor): B x S input tokens
+            stop_token (int): stop token id
+            max_tokens (int, optional): max tokens to generate. Defaults to 200.
+            use_cache (bool, optional): KV cache to use or not. Defaults to False.
+
+        Yields:
+            Generator[LongTensor, None, None]: generated tokens
+
+        """
+        token_countdown = max_tokens
+
+        while token_countdown > 0:
+            x: Tensor = self.embed_tokens(input_ids)
+            # x: B x S x d
+
+            x = self.decoder(x, use_cache=use_cache)
+            # x: B x S x d
+
+            logits = self.lm_head(x[:, -1, :])
+            # logits: B x C
+
+            probs = F.softmax(logits, dim=1)
+            # probs: B x C
+
+            generated_token_ids = torch.multinomial(probs, num_samples=1)
+            # generated_token_ids: B x 1
+
+            yield generated_token_ids
+
+            if (generated_token_ids == stop_token).all():
+                # If all generated stop tokens, end the loop.
+                break
+
+            if use_cache:
+                input_ids = generated_token_ids
+                # input_ids: B x 1
+            else:
+                input_ids = torch.cat([input_ids, generated_token_ids], dim=1)
+                # input_ids: B x (S + 1)
+
+            token_countdown -= 1
+
+    def reset_cache(self):
+        # Resets the KV Caches
+        [layer.self_attn.reset_cache() for layer in self.layers]
 
     @classmethod
     def from_checkpoint(cls, ckpt_file_path: str, device: str = "cpu"):
@@ -846,6 +978,24 @@ class LoraAdaptor:
                 state_dict[key] = value
         return state_dict
 
+    @torch.no_grad()
+    def load(self, lora_ckpt_file_path: str, device: str = "cpu"):
+        prefix = "module." if hasattr(self.model, "module") else ""
+
+        state_dict = torch.load(lora_ckpt_file_path, map_location=device)
+        state_dict = OrderedDict(
+            [(prefix + name, param) for name, param in state_dict.items()]
+        )
+        for name, buffer in self.model.named_buffers():
+            if name not in state_dict:
+                continue
+            buffer.copy_(state_dict[name])
+
+        for name, param in self.model.named_parameters():
+            if name not in state_dict:
+                continue
+            param.copy_(state_dict[name])
+
 
 ## ------------------- Optimization ------------------- ##
 
@@ -899,51 +1049,75 @@ def _non_training_loop(model, dl, criterion, device) -> float:
     return sum(total_loss) / len(total_loss)
 
 
-@torch.no_grad()
-def sample(
+def inference_loop(
     model: Gemma3,
-    tokenizer: Tokenizer,
-    messages: Tuple[Message, Message],
+    dataset: InstructDataset,
     device: str,
-    max_tokens: int = 50,
-) -> Generator[str, None, None]:
-    input_raw = tokenizer.apply_chat_template(messages)
-    print("prompt;\n", input_raw)
-    input_tokens: List[int] = tokenizer(input_raw)
-    input_ids = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    num_infer_samples: int = 3,
+    # TODO add if user messages needs to be inferred or inserted
+):
+    model.eval()
 
-    # input_ids: 1 x S
-    generated_token_id = None
-    generated_token_counter = 0
-    while generated_token_id != tokenizer.eos_token_id:
-        logits = model(input_ids)
-        # logits: 1 x S x C
+    tokenizer = dataset._tokenizer
 
-        probs = F.softmax(logits[:, -1, :], dim=1)
-        # probs: 1 x C
+    # get random samples
+    data_ids = list(range(len(dataset)))
+    for idx in random.sample(data_ids, k=num_infer_samples):
+        messages: List[Message] = deepcopy(dataset._data[idx])
 
-        generated_token_id = torch.multinomial(probs, num_samples=1)
-        # generated_token_id: 1 x 1
+        system_message = messages[0]
+        user_messages = filter(lambda message: message.role == "user", messages)
+        current_messages: List[Message] = [system_message]
+        message_offset: int = 0
+        max_token = max(
+            [
+                len(tokenizer.encode(message.content))
+                for message in messages
+                if message.role == "assistant"
+            ]
+        )
+        user_messages = list(user_messages)
+        user_messages = user_messages + user_messages
 
-        input_ids = torch.cat([input_ids, generated_token_id], dim=1)
-        # input_ids: 1 x (S + 1)
+        for user_message in user_messages:
+            current_messages.append(user_message)
+            input_raw: str = tokenizer.apply_chat_template(current_messages)
 
-        generated_token_id = generated_token_id.flatten().item()
+            input_delta_raw: str = input_raw[message_offset:]
+            message_offset += len(input_delta_raw)
 
-        yield tokenizer.decode([generated_token_id])
+            print(input_delta_raw, flush=True)
 
-        generated_token_counter += 1
+            input_ids: LongTensor = torch.tensor(
+                [tokenizer.encode(input_delta_raw)],
+                dtype=torch.long,
+                device=device,
+            )
+            # input_ids: 1, S
 
-        if generated_token_counter >= max_tokens:
-            break
+            assistant_message = Message(role="assistant", content="")
+            for token_id in model.sample(
+                input_ids,
+                tokenizer.eos_token_id,
+                max_tokens=max_token,
+                use_cache=True,
+            ):
+                token = tokenizer.decode([token_id.item()])
+                assistant_message.content += token
+                print(token, flush=True, end="")
+
+            message_offset += len(assistant_message.content)
+            current_messages.append(assistant_message)
+        model.reset_cache()
+        print("\n", "---" * 20, "\n")
 
 
 def main(args):
     model_name: str = args.model_name
     data_path: str = args.data_path
-    model_path: str = args.model_path
+    artifacts_path: str = args.artifacts_path
     tokenizer = Tokenizer.from_json_file(
-        os.path.join(model_path, f"{model_name}-tokenizer.json")
+        os.path.join(artifacts_path, f"{model_name}-tokenizer.json")
     )
     train_ds = InstructDataset.from_jsonl(
         os.path.join(data_path, "train.jsonl"), tokenizer
@@ -957,8 +1131,14 @@ def main(args):
     num_available_gpus: int = torch.cuda.device_count()
     is_multi_gpu_training: bool = num_available_gpus > 1 and device.startswith("cuda")
     multi_gpu_config: MultiGPUConfig = None
+    lora_ckpt_file_path: str = os.path.join(
+        artifacts_path, f"{model_name}-best-lora-rank-{args.rank}-sft.pt"
+    )
+    model_original_ckpt_file_path: str = os.path.join(
+        artifacts_path, f"{model_name}-it.ckpt"
+    )
 
-    model = Gemma3.from_checkpoint(os.path.join(model_path, f"{model_name}-it.ckpt"))
+    model = Gemma3.from_checkpoint(model_original_ckpt_file_path)
     model.eval()
 
     if is_multi_gpu_training:
@@ -975,6 +1155,10 @@ def main(args):
     lora_adaptor = LoraAdaptor(model, args.rank, alpha=args.alpha)
 
     lora_adaptor.register_layers(layer_types=(RoPEMultiHeadAttentionWithGQA,))
+
+    if args.resume:
+        print(f"Resuming from {lora_ckpt_file_path}")
+        lora_adaptor.load(lora_ckpt_file_path, device=device)
 
     model.to(device, dtype)
 
@@ -1044,29 +1228,15 @@ def main(args):
     )
 
     best_val_loss = math.inf
-    num_infer_samples: int = 1
+    num_infer_samples: int = args.num_infer_samples
 
     for i in range(epoch):
         if is_master:
             print(
                 f"running random {num_infer_samples} samples from validation set to sanity check"
             )
-            print("---" * 20)
-            # get random samples
-            ids = random.sample(list(range(len(val_ds))), k=num_infer_samples)
-            for idx in ids:
-                system_message, user_message, _ = deepcopy(val_ds._data[idx])
-                print("Response;")
-                for token in sample(
-                    model,
-                    tokenizer,
-                    (system_message, user_message),
-                    device,
-                    max_tokens=100,
-                ):
-                    print(token, flush=True, end="")
-                print()
-            print("---" * 20)
+            inference_loop(model, val_ds, device, num_infer_samples=num_infer_samples)
+
         train_loss = training_loop(model, train_dl, criterion, optimizer, device)
         if is_master:
             print(f"[{i + 1}/{epoch}] Epoch | Training Loss : {train_loss:.3f}")
@@ -1081,10 +1251,7 @@ def main(args):
 
             torch.save(
                 lora_adaptor.state_dict(),
-                os.path.join(
-                    model_path,
-                    f"{model_name}-best-lora-rank-{lora_adaptor.rank}-sft.pt",
-                ),
+                lora_ckpt_file_path,
             )
 
     test_loss = test_loop(model, test_dl, criterion, device)
@@ -1105,13 +1272,15 @@ if __name__ == "__main__":
         required=True,
     )
     ap.add_argument("--data-path", "-dp", type=str, default="data")
-    ap.add_argument("--model-path", "-mp", type=str, default="artifacts")
+    ap.add_argument("--artifacts-path", "-ap", type=str, default="artifacts")
+    ap.add_argument("--resume", action="store_true")
     ap.add_argument("--device", "-d", type=str, default="cuda", choices=["cpu", "cuda"])
     ap.add_argument("--num-process", "-ns", type=int, default=16)
     ap.add_argument("--learning-rate", "-lr", type=float, default=1e-4)
     ap.add_argument("--batch-size", "-bs", type=int, default=32)
     ap.add_argument("--epoch", "-e", type=int, default=10)
     ap.add_argument("--ignore-index", "-ig", type=int, default=-100)
+    ap.add_argument("--num-infer-samples", "-ni", type=int, default=3)
     ap.add_argument("--rank", "-r", type=int, required=True)
     ap.add_argument("--alpha", "-a", type=float, default=1.0)
 
