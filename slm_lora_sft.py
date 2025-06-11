@@ -728,6 +728,7 @@ class SmolLM2(nn.Module):
         input_ids: LongTensor,
         stop_token: int,
         max_tokens: int = 200,
+        use_cache: bool = False,
     ) -> Generator[LongTensor, None, None]:
         """Causal sampling from LLM by utilising KV Cache
 
@@ -735,21 +736,18 @@ class SmolLM2(nn.Module):
             input_ids (LongTensor): B x S input tokens
             stop_token (int): stop token id
             max_tokens (int, optional): max tokens to generate. Defaults to 200.
+            use_cache (bool, optional): KV cache to use or not. Defaults to False.
 
         Yields:
             Generator[LongTensor, None, None]: generated tokens
         """
-
-        generated_token_ids = None
-        # generated_token_ids: B x 1
-
         token_countdown = max_tokens
 
         while token_countdown > 0:
             x: Tensor = self.embed_tokens(input_ids)
             # x: B x S x d
 
-            x = self.decoder(x, use_cache=True)
+            x = self.decoder(x, use_cache=use_cache)
             # x: B x S x d
 
             logits = self.lm_head(x[:, -1, :])
@@ -767,8 +765,12 @@ class SmolLM2(nn.Module):
                 # If all generated stop tokens, end the loop.
                 break
 
-            input_ids = generated_token_ids
-            # input_ids: B x 1
+            if use_cache:
+                input_ids = generated_token_ids
+                # input_ids: B x 1
+            else:
+                input_ids = torch.cat([input_ids, generated_token_ids], dim=1)
+                # input_ids: B x (S + 1)
 
             token_countdown -= 1
 
@@ -954,8 +956,6 @@ def inference_loop(
     num_infer_samples: int = 3,
     # TODO add if user messages needs to be inferred or inserted
 ):
-    model.eval()
-
     tokenizer = dataset._tokenizer
 
     # get random samples
@@ -998,6 +998,7 @@ def inference_loop(
                 input_ids,
                 tokenizer.eos_token_id,
                 max_tokens=max_token,
+                use_cache=True,
             ):
                 token = tokenizer.decode([token_id.item()])
                 assistant_message.content += token

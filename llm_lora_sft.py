@@ -1056,8 +1056,6 @@ def inference_loop(
     num_infer_samples: int = 3,
     # TODO add if user messages needs to be inferred or inserted
 ):
-    model.eval()
-
     tokenizer = dataset._tokenizer
 
     # get random samples
