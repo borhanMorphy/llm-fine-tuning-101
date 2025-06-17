@@ -14,14 +14,21 @@ from llm_lora_sft import Gemma3, ModelConfig
 
 
 CHAT_TEMPLATE = """{{ bos_token }}<start_of_turn>user
-{{ messages[0]['content'] | trim }}
+{{ messages[0].content | trim }}
 
-{{ messages[1]['content'] | trim }}<end_of_turn>
-<start_of_turn>model
-{% if messages|length > 2 and messages[2]['content'] -%}
-{{ messages[2]['content'] | trim }}<end_of_turn>
+{{ messages[1].content | trim }}<end_of_turn>
+{% for message in messages[2:] -%}
+<start_of_turn>
+{%- if message.role == 'assistant' -%}
+model
+{%- else -%}
+{{ message.role }}
 {%- endif %}
-"""
+{{ message.content | trim }}<end_of_turn>
+{% endfor -%}
+{%- if messages[-1].role != 'assistant' %}
+<start_of_turn>model
+{%- endif %}"""
 
 MODEL_NAME_TO_HF_CHECKPOINT = {
     "gemma3-1b": "google/gemma-3-1b-it",

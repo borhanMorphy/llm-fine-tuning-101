@@ -13,16 +13,14 @@ sys.path.append(os.getcwd())
 from slm_full_sft import SmolLM2, ModelConfig
 
 
-CHAT_TEMPLATE = """
-{%- for message in messages %}
+CHAT_TEMPLATE = """{%- for message in messages %}
 <|im_start|>{{ message['role'] }}
 {{ message['content'] | trim }}
 <|im_end|>
 {%- endfor %}
-{%- if messages[-1]['role'] != 'assistant' %}
+{%- if messages and messages[-1]['role'] != 'assistant' %}
 <|im_start|>assistant
-{%- endif %}
-"""
+{%- endif %}"""
 
 MODEL_NAME_TO_HF_CHECKPOINT = {
     "smollm2-135m": "HuggingFaceTB/SmolLM2-135M-Instruct",

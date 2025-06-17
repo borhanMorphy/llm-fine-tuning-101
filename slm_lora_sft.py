@@ -56,9 +56,14 @@ class InstructDataset(Dataset):
         data = []
         for sample_json in raw_data:
             messages = []
-            for message in json.loads(sample_json):
-                messages.append(Message(**message))
-
+            chat_data = json.loads(sample_json)
+            for message in chat_data["messages"]:
+                messages.append(
+                    Message(
+                        role=message["role"],
+                        content=message["content"],
+                    )
+                )
             # Sanity check
             # TODO think about tool calling mb
             assert len(messages) >= 3, (
@@ -954,9 +959,13 @@ def inference_loop(
     dataset: InstructDataset,
     device: str,
     num_infer_samples: int = 3,
+    is_multi_gpu_training: bool = False,
     # TODO add if user messages needs to be inferred or inserted
 ):
     tokenizer = dataset._tokenizer
+
+    if is_multi_gpu_training:
+        model = model.module
 
     # get random samples
     data_ids = list(range(len(dataset)))
@@ -1133,7 +1142,13 @@ def main(args):
             print(
                 f"running random {num_infer_samples} samples from validation set to sanity check"
             )
-            inference_loop(model, val_ds, device, num_infer_samples=num_infer_samples)
+            inference_loop(
+                model,
+                val_ds,
+                device,
+                num_infer_samples=num_infer_samples,
+                is_multi_gpu_training=is_multi_gpu_training,
+            )
 
         train_loss = training_loop(model, train_dl, criterion, optimizer, device)
         if is_master:
